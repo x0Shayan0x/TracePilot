@@ -32,5 +32,14 @@ services:
       db:
         condition: service_healthy
 
+  simulator:
+    build: ./simulator
+
+    environment:
+      API_URL: http://api:8000
+
+    depends_on:
+      - api
+
 volumes:
   postgres_data:
