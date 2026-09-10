@@ -1,18 +1,27 @@
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from sqlalchemy import func, select, text, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta, timezone
+import uuid
 
 from app.database import engine, get_session
-from app.models import Base, ConnectionEvent
+from app.models import (
+    AgentToolCall,
+    Base,
+    ConnectionEvent,
+    Investigation,
+)
 from app.schemas import (
+    AgentToolCallResponse,
     ConnectionBurstResponse,
     ConnectionEventBatch,
     ConnectionEventCreate,
     ConnectionEventResponse,
     HighUniqueDestinationsResponse,
+    InvestigationCreate,
+    InvestigationResponse,
     TopProcessResponse,
     UnusualDestinationResponse,
 )
@@ -342,3 +351,77 @@ async def find_high_unique_destinations(
         )
         for row in result.all()
     ]
+    
+@app.post(
+    "/investigations",
+    response_model=InvestigationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_investigation(
+    investigation_data: InvestigationCreate,
+    session: AsyncSession = Depends(get_session),
+):
+    investigation = Investigation(
+        question=investigation_data.question,
+        status="pending",
+    )
+
+    session.add(investigation)
+    await session.commit()
+    await session.refresh(investigation)
+
+    return investigation
+
+
+@app.get(
+    "/investigations/{investigation_id}",
+    response_model=InvestigationResponse,
+)
+async def get_investigation(
+    investigation_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    investigation = await session.get(
+        Investigation,
+        investigation_id,
+    )
+
+    if investigation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Investigation not found",
+        )
+
+    return investigation
+    
+@app.get(
+    "/investigations/{investigation_id}/tool-calls",
+    response_model=list[AgentToolCallResponse],
+)
+async def get_investigation_tool_calls(
+    investigation_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    investigation = await session.get(
+        Investigation,
+        investigation_id,
+    )
+
+    if investigation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Investigation not found",
+        )
+
+    query = (
+        select(AgentToolCall)
+        .where(
+            AgentToolCall.investigation_id
+            == investigation_id
+        )
+        .order_by(AgentToolCall.created_at)
+    )
+
+    result = await session.execute(query)
+
+    return result.scalars().all()

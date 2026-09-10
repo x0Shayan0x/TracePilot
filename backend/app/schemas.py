@@ -53,3 +53,31 @@ class HighUniqueDestinationsResponse(BaseModel):
     unique_destination_count: int
     connection_count: int
     event_ids: list[uuid.UUID]
+    
+class InvestigationCreate(BaseModel):
+    question: str = Field(
+        min_length=5,
+        max_length=2000,
+    )
+
+
+class InvestigationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    question: str
+    status: str
+    answer: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class AgentToolCallResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    investigation_id: uuid.UUID
+    tool_name: str
+    arguments: dict
+    result: dict
+    created_at: datetime
