@@ -5,6 +5,7 @@ from sqlalchemy import func, select, text, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta, timezone
 import uuid
+from pydantic import ValidationError
 
 from app.database import engine, get_session
 from app.models import (
@@ -24,7 +25,13 @@ from app.schemas import (
     InvestigationResponse,
     TopProcessResponse,
     UnusualDestinationResponse,
+    AgentToolExecutionRequest,
 )
+from app.agent_tools import (
+    ToolNotAllowedError,
+    execute_agent_tool,
+)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with engine.begin() as connection:
@@ -425,3 +432,42 @@ async def get_investigation_tool_calls(
     result = await session.execute(query)
 
     return result.scalars().all()
+    
+@app.post(
+    "/debug/investigations/{investigation_id}/execute-tool"
+)
+async def debug_execute_agent_tool(
+    investigation_id: uuid.UUID,
+    request: AgentToolExecutionRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    investigation = await session.get(
+        Investigation,
+        investigation_id,
+    )
+
+    if investigation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Investigation not found",
+        )
+
+    try:
+        return await execute_agent_tool(
+            tool_name=request.tool_name,
+            raw_arguments=request.arguments,
+            investigation_id=investigation_id,
+            session=session,
+        )
+
+    except ToolNotAllowedError as error:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(error),
+        ) from error
+
+    except ValidationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=error.errors(),
+        ) from error

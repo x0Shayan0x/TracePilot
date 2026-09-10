@@ -81,3 +81,11 @@ class AgentToolCallResponse(BaseModel):
     arguments: dict
     result: dict
     created_at: datetime
+    
+class AgentToolExecutionRequest(BaseModel):
+    tool_name: str = Field(
+        min_length=1,
+        max_length=100,
+    )
+
+    arguments: dict
