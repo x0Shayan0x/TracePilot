@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import uuid
 from pydantic import ValidationError
 
+from app.agent import run_investigation_agent
 from app.database import engine, get_session
 from app.models import (
     AgentToolCall,
@@ -31,6 +32,9 @@ from app.agent_tools import (
     ToolNotAllowedError,
     execute_agent_tool,
 )
+import logging
+
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -370,14 +374,51 @@ async def create_investigation(
 ):
     investigation = Investigation(
         question=investigation_data.question,
-        status="pending",
+        status="running",
     )
 
     session.add(investigation)
     await session.commit()
     await session.refresh(investigation)
 
-    return investigation
+    try:
+        answer = await run_investigation_agent(
+            question=investigation.question,
+            investigation_id=investigation.id,
+            session=session,
+        )
+
+        investigation.answer = answer
+        investigation.status = "completed"
+        investigation.completed_at = datetime.now(
+            timezone.utc
+        )
+
+        await session.commit()
+        await session.refresh(investigation)
+
+        return investigation
+
+    except Exception:
+        logger.exception(
+            "Investigation %s failed",
+            investigation.id,
+        )
+
+        investigation.status = "failed"
+        investigation.answer = (
+            "The investigation could not be completed."
+        )
+        investigation.completed_at = datetime.now(
+            timezone.utc
+        )
+
+        await session.commit()
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Investigation agent failed.",
+        )
 
 
 @app.get(

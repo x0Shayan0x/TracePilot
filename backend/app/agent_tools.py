@@ -26,6 +26,13 @@ class TopNetworkProcessesArguments(BaseModel):
 class ConnectionBurstsArguments(BaseModel):
     threshold: int = Field(default=100, ge=1, le=10000)
     minutes: int = Field(default=60, ge=1, le=1440)
+    
+class UnusualDestinationsArguments(BaseModel):
+    pid: int = Field(ge=1)
+
+
+class EventTimelineArguments(BaseModel):
+    pid: int = Field(ge=1)
 
 
 async def get_process_connections(
@@ -176,6 +183,175 @@ async def find_connection_bursts(
         "bursts": bursts,
     }
 
+async def find_unusual_destinations(
+    session: AsyncSession,
+    arguments: UnusualDestinationsArguments,
+) -> dict:
+    now = datetime.now(timezone.utc)
+
+    # Investigate the last hour.
+    recent_start = now - timedelta(minutes=60)
+
+    # Compare it against the preceding 24 hours.
+    baseline_start = recent_start - timedelta(hours=24)
+
+    baseline_query = (
+        select(
+            ConnectionEvent.destination_ip,
+            ConnectionEvent.destination_port,
+        )
+        .where(
+            ConnectionEvent.pid == arguments.pid,
+            ConnectionEvent.timestamp >= baseline_start,
+            ConnectionEvent.timestamp < recent_start,
+        )
+        .distinct()
+    )
+
+    baseline_result = await session.execute(
+        baseline_query
+    )
+
+    baseline_destinations = {
+        (
+            str(row.destination_ip),
+            row.destination_port,
+        )
+        for row in baseline_result.all()
+    }
+
+    recent_query = (
+        select(
+            ConnectionEvent.destination_ip,
+            ConnectionEvent.destination_port,
+            func.min(ConnectionEvent.timestamp).label(
+                "first_seen"
+            ),
+            func.array_agg(ConnectionEvent.id).label(
+                "event_ids"
+            ),
+        )
+        .where(
+            ConnectionEvent.pid == arguments.pid,
+            ConnectionEvent.timestamp >= recent_start,
+            ConnectionEvent.timestamp <= now,
+        )
+        .group_by(
+            ConnectionEvent.destination_ip,
+            ConnectionEvent.destination_port,
+        )
+        .order_by(func.min(ConnectionEvent.timestamp))
+    )
+
+    recent_result = await session.execute(recent_query)
+
+    unusual = []
+
+    for row in recent_result.all():
+        destination = (
+            str(row.destination_ip),
+            row.destination_port,
+        )
+
+        if destination not in baseline_destinations:
+            unusual.append(
+                {
+                    "destination_ip": destination[0],
+                    "destination_port": destination[1],
+                    "first_seen": row.first_seen.isoformat(),
+                    "event_ids": [
+                        str(event_id)
+                        for event_id in row.event_ids
+                    ],
+                }
+            )
+
+    return {
+        "pid": arguments.pid,
+        "recent_minutes": 60,
+        "baseline_minutes": 1440,
+        "unusual_destinations": unusual,
+    }
+    
+async def get_event_timeline(
+    session: AsyncSession,
+    arguments: EventTimelineArguments,
+) -> dict:
+    cutoff_time = datetime.now(timezone.utc) - timedelta(
+        hours=24
+    )
+
+    query = (
+        select(ConnectionEvent)
+        .where(
+            ConnectionEvent.pid == arguments.pid,
+            ConnectionEvent.timestamp >= cutoff_time,
+        )
+        .order_by(ConnectionEvent.timestamp.desc())
+        .limit(500)
+    )
+
+    result = await session.execute(query)
+
+    # The query retrieves the newest 500. Reverse them so
+    # timeline entries are constructed chronologically.
+    events = list(reversed(result.scalars().all()))
+
+    timeline_by_minute = {}
+
+    for event in events:
+        minute = event.timestamp.astimezone(
+            timezone.utc
+        ).replace(
+            second=0,
+            microsecond=0,
+        )
+
+        minute_key = minute.isoformat()
+
+        if minute_key not in timeline_by_minute:
+            timeline_by_minute[minute_key] = {
+                "window_start": minute_key,
+                "connection_count": 0,
+                "destinations": set(),
+                "event_ids": [],
+            }
+
+        entry = timeline_by_minute[minute_key]
+
+        entry["connection_count"] += 1
+
+        entry["destinations"].add(
+            f"{event.destination_ip}:"
+            f"{event.destination_port}"
+        )
+
+        entry["event_ids"].append(str(event.id))
+
+    timeline = []
+
+    for entry in timeline_by_minute.values():
+        timeline.append(
+            {
+                "window_start": entry["window_start"],
+                "connection_count": (
+                    entry["connection_count"]
+                ),
+                "destinations": sorted(
+                    entry["destinations"]
+                ),
+                "event_ids": entry["event_ids"],
+            }
+        )
+
+    return {
+        "pid": arguments.pid,
+        "lookback_hours": 24,
+        "returned_event_count": len(events),
+        "truncated": len(events) == 500,
+        "timeline": timeline,
+    }
+
 TOOL_REGISTRY = {
     "get_process_connections": {
         "arguments_model": ProcessConnectionsArguments,
@@ -188,6 +364,14 @@ TOOL_REGISTRY = {
     "find_connection_bursts": {
         "arguments_model": ConnectionBurstsArguments,
         "function": find_connection_bursts,
+    },
+    "find_unusual_destinations": {
+        "arguments_model": UnusualDestinationsArguments,
+        "function": find_unusual_destinations,
+    },
+    "get_event_timeline": {
+        "arguments_model": EventTimelineArguments,
+        "function": get_event_timeline,
     },
 }
 
