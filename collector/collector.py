@@ -9,6 +9,12 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from event_parser import (
+    ConnectionEvent,
+    ConnectionEventV6,
+    parse_ipv4_event,
+    parse_ipv6_event,
+)
 
 from bcc import BPF
 
@@ -259,29 +265,7 @@ int trace_tcp_v6_connect_return(struct pt_regs *ctx) {
 """
 
 
-class ConnectionEvent(ctypes.Structure):
-    _fields_ = [
-        ("timestamp_ns", ctypes.c_uint64),
-        ("duration_ns", ctypes.c_uint64),
-        ("pid", ctypes.c_uint32),
-        ("uid", ctypes.c_uint32),
-        ("destination_ip", ctypes.c_uint32),
-        ("destination_port", ctypes.c_uint16),
-        ("ip_version", ctypes.c_uint8),
-        ("process_name", ctypes.c_char * 16),
-    ]
 
-class ConnectionEventV6(ctypes.Structure):
-    _fields_ = [
-        ("timestamp_ns", ctypes.c_uint64),
-        ("duration_ns", ctypes.c_uint64),
-        ("pid", ctypes.c_uint32),
-        ("uid", ctypes.c_uint32),
-        ("destination_ip", ctypes.c_ubyte * 16),
-        ("destination_port", ctypes.c_uint16),
-        ("ip_version", ctypes.c_uint8),
-        ("process_name", ctypes.c_char * 16),
-    ]
 
 BATCH_SIZE = 50
 FLUSH_INTERVAL_SECONDS = 1.0
@@ -294,122 +278,58 @@ collector_pid = os.getpid()
 wall_clock_offset_ns = time.time_ns() - time.monotonic_ns()
 
 
-def kernel_time_to_datetime(timestamp_ns):
-    unix_timestamp_ns = wall_clock_offset_ns + timestamp_ns
-
-    return datetime.fromtimestamp(
-        unix_timestamp_ns / 1_000_000_000,
-        tz=timezone.utc,
-    )
-
-
 def handle_event(cpu, data, size):
-    event = ctypes.cast(
-        data,
-        ctypes.POINTER(ConnectionEvent),
-    ).contents
+    raw_event = ctypes.string_at(data, size)
 
-    # Ignore connections created by this collector itself.
-    # Otherwise, posting a batch to the API would generate
-    # another network event and create a feedback loop.
-    if event.pid == collector_pid:
+    api_event = parse_ipv4_event(
+        raw_event,
+        wall_clock_offset_ns,
+    )
+
+    # Ignore connections created by this collector.
+    if api_event["pid"] == collector_pid:
         return
 
-    destination_ip = socket.inet_ntoa(
-        ctypes.string_at(
-            ctypes.byref(
-                ctypes.c_uint32(event.destination_ip)
-            ),
-            4,
-        )
-    )
-
-    destination_port = socket.ntohs(
-        event.destination_port
-    )
-    
-    if destination_port in {8000, 5432}:
+    # Ignore connections to TracePilot's API and database.
+    if api_event["destination_port"] in {
+        8000,
+        5432,
+    }:
         return
-
-    process_name = (
-        bytes(event.process_name)
-        .split(b"\0", 1)[0]
-        .decode("utf-8", errors="replace")
-    )
-
-    timestamp = kernel_time_to_datetime(
-        event.timestamp_ns
-    )
-
-    api_event = {
-        "timestamp": timestamp.isoformat(),
-        "pid": event.pid,
-        "process_name": process_name,
-        "uid": event.uid,
-        "destination_ip": destination_ip,
-        "destination_port": destination_port,
-        "ip_version": event.ip_version,
-        "duration_ms": event.duration_ns / 1_000_000,
-        "source": "ebpf",
-    }
 
     pending_events.append(api_event)
 
     print(
-        f"Captured PID={event.pid} "
-        f"COMM={process_name} "
-        f"DEST={destination_ip}:{destination_port}"
+        f"Captured PID={api_event['pid']} "
+        f"COMM={api_event['process_name']} "
+        f"DEST={api_event['destination_ip']}:"
+        f"{api_event['destination_port']}"
     )
     
 def handle_ipv6_event(cpu, data, size):
-    event = ctypes.cast(
-        data,
-        ctypes.POINTER(ConnectionEventV6),
-    ).contents
+    raw_event = ctypes.string_at(data, size)
 
-    if event.pid == collector_pid:
+    api_event = parse_ipv6_event(
+        raw_event,
+        wall_clock_offset_ns,
+    )
+
+    if api_event["pid"] == collector_pid:
         return
 
-    destination_port = socket.ntohs(
-        event.destination_port
-    )
-
-    if destination_port in {8000, 5432}:
+    if api_event["destination_port"] in {
+        8000,
+        5432,
+    }:
         return
 
-    destination_ip = socket.inet_ntop(
-        socket.AF_INET6,
-        bytes(event.destination_ip),
-    )
-
-    process_name = (
-        bytes(event.process_name)
-        .split(b"\0", 1)[0]
-        .decode("utf-8", errors="replace")
-    )
-
-    timestamp = kernel_time_to_datetime(
-        event.timestamp_ns
-    )
-
-    pending_events.append(
-        {
-            "timestamp": timestamp.isoformat(),
-            "pid": event.pid,
-            "process_name": process_name,
-            "uid": event.uid,
-            "destination_ip": destination_ip,
-            "destination_port": destination_port,
-            "ip_version": 6,
-            "duration_ms": event.duration_ns / 1_000_000,
-            "source": "ebpf",
-        }
-    )
+    pending_events.append(api_event)
 
     print(
-        f"Captured IPv6 PID={event.pid} "
-        f"COMM={process_name} "
-        f"DEST=[{destination_ip}]:{destination_port}"
+        f"Captured IPv6 PID={api_event['pid']} "
+        f"COMM={api_event['process_name']} "
+        f"DEST=[{api_event['destination_ip']}]:"
+        f"{api_event['destination_port']}"
     )
 
 

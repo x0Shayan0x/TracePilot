@@ -1,5 +1,6 @@
 import uuid
-
+import re
+from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_tools import execute_agent_tool
@@ -135,6 +136,66 @@ TOOLS = [
     },
 ]
 
+class EvidenceValidationError(RuntimeError):
+    pass
+
+
+def extract_tool_event_ids(value: Any) -> set[str]:
+    event_ids = set()
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "event_id" and isinstance(child, str):
+                event_ids.add(child)
+
+            elif key == "event_ids" and isinstance(child, list):
+                event_ids.update(
+                    item
+                    for item in child
+                    if isinstance(item, str)
+                )
+
+            else:
+                event_ids.update(
+                    extract_tool_event_ids(child)
+                )
+
+    elif isinstance(value, list):
+        for child in value:
+            event_ids.update(
+                extract_tool_event_ids(child)
+            )
+
+    return event_ids
+
+
+def validate_report_evidence(
+    report: str,
+    allowed_event_ids: set[str],
+) -> None:
+    cited_event_ids = set(
+        re.findall(
+            r"\[event:([0-9a-fA-F-]{36})\]",
+            report,
+        )
+    )
+
+    invented_event_ids = (
+        cited_event_ids - allowed_event_ids
+    )
+
+    if invented_event_ids:
+        raise EvidenceValidationError(
+            "Report cited event IDs that were not "
+            f"returned by tools: "
+            f"{sorted(invented_event_ids)}"
+        )
+
+    if allowed_event_ids and not cited_event_ids:
+        raise EvidenceValidationError(
+            "Report used event evidence without citing "
+            "any returned event IDs."
+        )
 
 async def run_investigation_agent(
     question: str,
@@ -151,6 +212,8 @@ async def run_investigation_agent(
         instructions=SYSTEM_PROMPT,
     )
 
+    allowed_event_ids: set[str] = set()
+
     maximum_rounds = 8
 
     for _ in range(maximum_rounds):
@@ -159,6 +222,11 @@ async def run_investigation_agent(
                 raise RuntimeError(
                     "Provider returned no investigation report."
                 )
+
+            validate_report_evidence(
+                response.text,
+                allowed_event_ids,
+            )
 
             return response.text
 
@@ -170,6 +238,10 @@ async def run_investigation_agent(
                 raw_arguments=request.arguments,
                 investigation_id=investigation_id,
                 session=session,
+            )
+            
+            allowed_event_ids.update(
+                extract_tool_event_ids(result)
             )
 
             tool_results.append(
